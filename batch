@@ -1,0 +1,205 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+=pod
+
+CLEANUP_STALE_JOBS:
+    for each doing/batch.pid file
+        if exists doing/batch
+            if (PID, CMD) = read doing/batch.pid then
+                if PID exists and is CMD then
+                    next doing/BATCH file
+        # job is stale
+        remove doing/batch.pid
+        rename doing/batch.log todo/batch.log
+        rename doing/batch todo/batch
+
+# NOTE: On race conditions: The pid file needs to be created before we do *any*
+# work on a batch job, and not removed until *everything* is finished, this
+# avoid race conditions when starting parallel threads and cleaning up stale
+# jobs.
+START_JOB:
+    batch = name of first batch file
+    # To avoid races between other processes doing the same thing at the same
+    # time, if pid file already exist we should fail and we should continue try
+    # again with the next file in the directory.
+    create doing/batch.pid without overwriting
+        or restart from START_JOB
+    rename todo/batch -> doing/batch
+        or die "This should never happen"
+    # Here we know we're the only process processing this file.
+    open doing/batch
+       process doing/batch
+
+
+=cut
+
+
+use Cwd 'realpath';
+
+my ($todo_dir, $temp_dir, $done_dir) = qw(todo temp done);
+
+mkdir $todo_dir;
+mkdir $temp_dir;
+mkdir $done_dir;
+
+################################################################################
+
+# Usage: read_dir DIR[, IGNORE...]
+#
+# In scalar context: Return first file/dir name in DIR (or 'undef' if DIR is
+# empty).
+#
+# In list context: Return list of files in dir (empty list if dir is empty).
+#
+# Files/dirs listed as IGNORE(s) (in addition to '.' and '..') will be be
+# ignored when reading the directory.
+
+# FIXME: replace @ignore_file with MATCHING regex
+sub read_dir {
+    my ($dir, @ignore_file) = @_;
+    my %ignore = map { ($_ => 1) } (".", "..", @ignore_file);
+    opendir(my $fh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
+    my @file;
+    while (1) {
+        my $file = readdir $fh;
+        if (not defined $file) { last }
+        if ($ignore{$file}   ) { next }
+        push @file, $file;
+        if (not wantarray    ) { last }
+    }
+    closedir($fh) or die("Failed to close dir '$dir' after reading: $!\n");
+    return wantarray ? @file : $file[0];
+}
+
+# Return false if file already exists (in which case it will not be
+# overwritten), true if it could be written. die() on failures.
+sub write_file_noclobber {
+    my ($file, @data) = @_;
+    use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+    sysopen(my $fh, $file, O_WRONLY | O_CREAT | O_EXCL)
+        or return (); #die "Failed to open file '$file' for writing: $!\n";
+
+    #open(my $fh, ">", $file) or die "Failed to open file '$file' for writing: $!\n";
+    print $fh @data;
+    close($fh) or die "Failed to close file '$file' after writing: $!\n";
+    return 1;
+}
+
+sub read_file {
+    my ($file) = @_;
+    open(my $fh, "<", $file) or die "Failed to open file '$file' for reading: $!\n";
+    my $data = do {
+        local $/ = undef;
+        <$fh>;
+    };
+    chomp($data);
+    close($fh) or die "Failed to close file '$file' after reading: $!\n";
+    return $data;
+}
+
+sub delete_file {
+    my ($file) = @_;
+    unlink($file) or die "Failed to delete file '$file': $!\n";
+}
+
+sub rename_file {
+    my ($file, $dest_dir) = @_;
+    rename($file, $dest_dir)
+        or die "Failed to move '$file' to dir '$dest_dir': $!\n";
+}
+
+################################################################################
+
+# # Move interrupted indexing jobs from 'doing' dir into 'todo'.
+# foreach (read_dir $temp_dir) {
+#     my ($file, $file_ext) = m#^ (.*?) ([.](?:log|pid)|) $#x;
+#     if ($file_ext ne ".pid") { next }
+
+#     # Don't touch files for still running index process. (We determine by
+#     # checking that pid in pidfile belongs to a process that is (a) still
+#     # running and (b) has command path as this script.)
+#     {
+#         my $pid = eval { read_file("$temp_dir/$file.pid") } // "";
+#         my $cmd = eval { read_file("/proc/$pid/cmdline")   } // "";
+#         if (realpath($0) eq realpath($cmd)) {
+#             warn "Indexing job '$file' is still running\n";
+#             next;
+#         }
+#     }
+
+#     # We've found an orphaned index job, move its files to 'todo' dir.
+#     eval { rename_file "$temp_dir/$file",     "$todo_dir/$file"     };
+#     eval { rename_file "$temp_dir/$file.log", "$todo_dir/$file.log" };
+#     eval { delete_file "$temp_dir/$file.pid" };
+#     if (-e "$todo_dir/$file") {
+#         warn "Previous indexing job '$file' has crashed, will resume it\n";
+#     }
+# }
+
+# As long as there are files in 'todo' dir.
+my @ignore_file;
+while (defined(my $file = read_dir($todo_dir, @ignore_file))) {
+    my ($file_ext) = $file =~ m#([.](?:log|pid)|)$#x;
+
+    if ($file_ext ne "") {
+        #print "Will ignore '$file' with extension '$file_ext'\n";
+        push @ignore_file, $file;
+        next;
+    }
+
+    my $batch_file = "$temp_dir/$file";
+    my $log_file   = "$temp_dir/$file.log";
+    my $pid_file   = "$temp_dir/$file.pid";
+
+    print "PROCESSING: $file\n";
+    write_file_noclobber("$temp_dir/$file.pid", $$) or do {
+        warn "    Job '$file' is already running\n";
+        push @ignore_file, $file;
+        next;
+    };
+    print "    Created pidfile: $pid_file\n";
+
+    rename_file("$todo_dir/$file", "$temp_dir/$file");
+    eval { rename_file("$todo_dir/$file.log", "$temp_dir/$file.log") };
+
+    # Read previously processed ids from log (if any).
+    my %already_done = map {
+        # FIXME: should not include last line unless it ends in newline
+        $_ eq "" ? () : ($_ => 1);
+    } eval { read_file($log_file) };
+
+    print "    Appending to logfile: $log_file\n";
+    open(my $log, ">>", $log_file)
+        or die "Failed to open file '$log_file' for appending: $!";
+
+    print "    Reading from batch file: $batch_file\n";
+    open(my $batch, "<", $batch_file)
+        or die "Failed to open file '$batch_file' for reading: $!";
+
+    while (defined(my $vizone_id = <$batch>)) {
+        chomp($vizone_id);
+        if (exists $already_done{$vizone_id}) { next }
+        print "        ID: $vizone_id\n";
+
+        # index vizone_id   OR die "Failed to index!!"
+
+        print $log "$vizone_id\n";
+        $already_done{$vizone_id} = 1;
+    }
+
+    exit;
+    print "    rename_file($batch_file, '$done_dir/$file');\n";
+    rename_file($batch_file, "$done_dir/$file");
+    close($batch) or die "Failed to close file '$batch_file' after reading: $!\n";
+    close($log)   or die "Failed to close file '$log_file' after writing: $!\n";
+
+    print "    delete_file($log_file);\n";
+    delete_file($log_file);
+    print "    delete_file($pid_file);\n";
+    delete_file($pid_file);
+}
+
+#return 1;
