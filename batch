@@ -2,74 +2,10 @@
 
 use strict;
 use warnings;
-
-=pod
-
-CLEANUP_STALE_JOBS:
-    for each doing/batch.pid file
-        if exists doing/batch
-            if (PID, CMD) = read doing/batch.pid then
-                if PID exists and is CMD then
-                    next doing/BATCH file
-        # job is stale
-        remove doing/batch.pid
-        rename doing/batch.log todo/batch.log
-        rename doing/batch todo/batch
-
-# NOTE: On race conditions: The pid file needs to be created before we do *any*
-# work on a batch job, and not removed until *everything* is finished, this
-# avoid race conditions when starting parallel threads and cleaning up stale
-# jobs.
-START_JOB:
-    batch = name of first batch file
-    # To avoid races between other processes doing the same thing at the same
-    # time, if pid file already exist we should fail and we should continue try
-    # again with the next file in the directory.
-    create doing/batch.pid without overwriting
-        or restart from START_JOB
-    rename todo/batch -> doing/batch
-        or die "This should never happen"
-    # Here we know we're the only process processing this file.
-    open doing/batch
-       process doing/batch
-
-
-
-CLEANUP_STALE_JOBS:
-    for each doing/batch.pid file
-        if exists doing/batch
-            if (PID, CMD) = read doing/batch.pid then
-                if PID exists and is CMD then
-                    next doing/BATCH file
-        # job is stale
-        remove doing/batch.pid
-        rename doing/batch.log todo/batch.log
-        rename doing/batch todo/batch
-
-# NOTE: On race conditions: The pid file needs to be created before we do *any*
-# work on a batch job, and not removed until *everything* is finished, this
-# avoid race conditions when starting parallel threads and cleaning up stale
-# jobs.
-START_JOB:
-    batch = name of first batch file
-    # To avoid races between other processes doing the same thing at the same
-    # time, if pid file already exist we should fail and we should continue try
-    # again with the next file in the directory.
-    open batch.todo for reading
-    lock batch.todo exclusively
-    create log
-    # Here we know we're the only process processing this file.
-    process batch.todo
-    unlock batch.todo
-
-=cut
-
-
 use Cwd 'realpath';
 use Fcntl qw(LOCK_EX LOCK_NB);
 
 my $dir = ".";
-
 
 ################################################################################
 
@@ -120,6 +56,15 @@ sub rename_file {
 
 ################################################################################
 
+#
+# 1. An exclusive lock on 'batch.todo' file must exist throughout the
+#   'batch.log' file's existence. (We can then use the lock to determine if a
+#   job is currently in progress, without any race conditions.)
+#
+# 2. 'batch.log' must be deleted only after 'batch.todo' has been marked as
+#    done by renaming it 'batch.done'. This way, if the 'batch.todo' job ever
+#    crashes, it can always be resumed (since the logfile will always exist).
+#
 my $count = 0;
 my @ignore_file;
 while (defined(my $file = read_dir($dir, @ignore_file))) {
@@ -140,32 +85,30 @@ while (defined(my $file = read_dir($dir, @ignore_file))) {
 
     open(my $todo, "<", $todo_file)
         or die "Failed to open job file '$todo_file' for reading: $!";
+
     flock($todo, LOCK_EX | LOCK_NB) or do {
-        warn "Indexing job '$file' is still in progress\n";
+        warn "Job '$file' is in progress, won't touch\n";
         push @ignore_file, $file;
         next;
     };
 
     # Read previously processed ids from log (if any).
     my %already_done = map { ($_ => 1) } read_file($log_file);
-    warn "Indexing job '$file' exited uncleanly, will resume it\n"
-        if %already_done;
+    warn "Job '$file' is unfinished, resuming it\n" if %already_done;
 
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
     select((select($log), $| = 1)[0]);         # don't buffer log
 
-    print "PROCESSING JOB: '$file'\n";
-    print "    Logging: '$log_file'\n";
-    print "    Reading: '$todo_file'\n";
+    print "PROCESSING: '$file'\n";
     $count += 1;
     while (defined(my $id = <$todo>)) {
         chomp($id);
         if (exists $already_done{$id}) {
-            print "        '$id' -- done by previous job\n";
+            print "    '$id' -- done by previous job\n";
             next;
         }
-        print "        '$id' -- processing\n";
+        print "    '$id' -- processing\n";
 
         # index id   OR die "Failed to index!!"
         sleep 1;
@@ -173,14 +116,12 @@ while (defined(my $file = read_dir($dir, @ignore_file))) {
         print $log "$id\n";
         $already_done{$id} = 1;
     }
-    close($todo) or die "Failed to close file '$todo_file' after reading: $!\n";
-    close($log)  or die "Failed to close file '$log_file' after writing: $!\n";
-
-    print "    Finished\n";
-    print "        Renaming '$todo_file' => '$done_file'\n";
-    print "        Deleting '$log_file'\n";
-    rename_file($todo_file, $done_file);
-    delete_file($log_file);
+    print "    Done\n";
+    close($log) or die "Failed to close file '$log_file' after writing: $!\n";
+    rename_file($todo_file, $done_file);       # 1. mark job as done by rename
+    delete_file($log_file);                    # 2. delete progress log
+    close($todo)                               # 3. release lock last
+        or die "Failed to close file '$todo_file' after reading: $!\n";
 }
 if ($count == 0) {
     print "No '.todo' files found to process\n";
@@ -188,4 +129,4 @@ if ($count == 0) {
     print "Processed $count '.todo' files\n";
 }
 
-#return 1;
+#[eof]
