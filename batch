@@ -34,10 +34,39 @@ START_JOB:
        process doing/batch
 
 
+
+CLEANUP_STALE_JOBS:
+    for each doing/batch.pid file
+        if exists doing/batch
+            if (PID, CMD) = read doing/batch.pid then
+                if PID exists and is CMD then
+                    next doing/BATCH file
+        # job is stale
+        remove doing/batch.pid
+        rename doing/batch.log todo/batch.log
+        rename doing/batch todo/batch
+
+# NOTE: On race conditions: The pid file needs to be created before we do *any*
+# work on a batch job, and not removed until *everything* is finished, this
+# avoid race conditions when starting parallel threads and cleaning up stale
+# jobs.
+START_JOB:
+    batch = name of first batch file
+    # To avoid races between other processes doing the same thing at the same
+    # time, if pid file already exist we should fail and we should continue try
+    # again with the next file in the directory.
+    open batch.todo for reading
+    lock batch.todo exclusively
+    create log
+    # Here we know we're the only process processing this file.
+    process batch.todo
+    unlock batch.todo
+
 =cut
 
 
 use Cwd 'realpath';
+use Fcntl qw(LOCK_EX LOCK_NB);
 
 my $dir = ".";
 
@@ -69,20 +98,6 @@ sub read_dir {
     return wantarray ? @file : $file[0];
 }
 
-# Return false if file already exists (in which case it will not be
-# overwritten), true if it could be written. die() on failures.
-sub write_file_noclobber {
-    my ($file, @data) = @_;
-    use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
-    sysopen(my $fh, $file, O_WRONLY | O_CREAT | O_EXCL)
-        or return (); #die "Failed to open file '$file' for writing: $!\n";
-
-    #open(my $fh, ">", $file) or die "Failed to open file '$file' for writing: $!\n";
-    print $fh @data;
-    close($fh) or die "Failed to close file '$file' after writing: $!\n";
-    return 1;
-}
-
 sub read_file {
     my ($file) = @_;
     open(my $fh, "<", $file) or return ();
@@ -105,73 +120,45 @@ sub rename_file {
 
 ################################################################################
 
+my $count = 0;
 my @ignore_file;
-
-sub read_cmd {
-    my ($pid) = @_;
-    open(my $fh, "/proc/$pid/cmdline") or die "badly";
-    local $/ = "\0";
-    my @cmd = <$fh>;
-    return @cmd;
-}
-
-sub cmd_path {
-    my ($pid) = @_;
-    return eval { realpath("/proc/$pid/exe") } // "";
-}
-
-my $me = cmd_path($$);
-
-my $num = 0;
 while (defined(my $file = read_dir($dir, @ignore_file))) {
 
-    if ($file !~ m#\.todo#) {
-        # Delete orphaned '.log' or '.pid' files.
-        if ($file =~ m#^ (.*) \.(pid|log) $#x and not -e "$1.todo") {
-            warn "Deleting orphaned $2 file '$file'\n";
+    if (not $file =~ m#\.todo#) {              # for non-'.todo' files
+        if ($file =~ m#^ (.*) \.log $#x and not -e "$1.todo") {
+            warn "Deleting orphaned log file '$file'\n";
             delete_file "$file";
         }
-        #print "Will ignore '$file'\n";
         push @ignore_file, $file;
         next;
     }
-    my ($base)    = $file =~ m#^(.*)\.todo$#;
-    my $todo_file = "$dir/$base.todo";
-    my $done_file = "$dir/$base.done";
-    my $log_file  = "$dir/$base.log";
-    my $pid_file  = "$dir/$base.pid";
 
-    if (-e $pid_file) {                        # clean up a stale job
-        my $pid = read_file($pid_file) // "";
-        my $cmd = cmd_path($pid);
-        if ($cmd eq $me) {
-            warn "Indexing job '$file' is in progress\n";
-            push @ignore_file, $file;
-            next;
-        }
-        # We've found an orphaned index job.
-        delete_file $pid_file;
-        warn "Indexing job '$file' exited uncleanly, will resume it\n";
-    }
-    $num += 1;
-    print "PROCESSING: '$todo_file'\n";
-    write_file_noclobber("$pid_file", $$) or do {
-        warn "    Job '$file' is already running\n";
+    my ($todo_file, $done_file, $log_file) = do {
+        my ($base) = $file =~ m#^(.*)\.todo$#;
+        ("$dir/$base.todo", "$dir/$base.done", "$dir/$base.log");
+    };
+
+    open(my $todo, "<", $todo_file)
+        or die "Failed to open job file '$todo_file' for reading: $!";
+    flock($todo, LOCK_EX | LOCK_NB) or do {
+        warn "Indexing job '$file' is still in progress\n";
         push @ignore_file, $file;
         next;
     };
-    print "    Pidfile: '$pid_file' created\n";
 
     # Read previously processed ids from log (if any).
     my %already_done = map { ($_ => 1) } read_file($log_file);
+    warn "Indexing job '$file' exited uncleanly, will resume it\n"
+        if %already_done;
 
-    print "    Logging: '$log_file'\n";
-    print "    Reading: '$todo_file'\n";
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
-    open(my $todo, "<", $todo_file)
-        or die "Failed to open file '$todo_file' for reading: $!";
     select((select($log), $| = 1)[0]);         # don't buffer log
+
+    print "PROCESSING JOB: '$file'\n";
+    print "    Logging: '$log_file'\n";
+    print "    Reading: '$todo_file'\n";
+    $count += 1;
     while (defined(my $id = <$todo>)) {
         chomp($id);
         if (exists $already_done{$id}) {
@@ -190,17 +177,15 @@ while (defined(my $file = read_dir($dir, @ignore_file))) {
     close($log)  or die "Failed to close file '$log_file' after writing: $!\n";
 
     print "    Finished\n";
-    print "        renaming '$todo_file' => '$done_file'\n";
+    print "        Renaming '$todo_file' => '$done_file'\n";
+    print "        Deleting '$log_file'\n";
     rename_file($todo_file, $done_file);
-    print "        deleting '$log_file'\n";
     delete_file($log_file);
-    print "        deleting '$pid_file'\n";
-    delete_file($pid_file);
 }
-if ($num == 0) {
+if ($count == 0) {
     print "No '.todo' files found to process\n";
 } else {
-    print "Processed $num '.todo' files\n";
+    print "Processed $count '.todo' files\n";
 }
 
 #return 1;
