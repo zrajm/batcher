@@ -2,59 +2,54 @@
 
 use strict;
 use warnings;
-use Cwd 'realpath';
 use Fcntl qw(LOCK_EX LOCK_NB);
+use File::Slurp 'read_file';
 
 my $dir = ".";
 
 ################################################################################
 
-# Usage: read_dir DIR[, IGNORE...]
-#
-# In scalar context: Return first file/dir name in DIR (or 'undef' if DIR is
-# empty).
-#
-# In list context: Return list of files in dir (empty list if dir is empty).
-#
-# Files/dirs listed as IGNORE(s) (in addition to '.' and '..') will be be
-# ignored when reading the directory.
-
-# FIXME: replace @ignore_file with MATCHING regex
-sub read_dir {
-    my ($dir, @ignore_file) = @_;
-    my %ignore = map { ($_ => 1) } (".", "..", @ignore_file);
-    opendir(my $fh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
-    my @file;
-    while (defined(my $file = readdir $fh)) {
-        next if $ignore{$file};
-        push @file, $file;
-        last unless wantarray;
+sub first_matching_file {
+    my ($dir, %sub) = @_;
+    opendir(my $dh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
+    while (defined(my $file = readdir($dh))) {
+        my ($base, $ext) = $file =~ /^(.*?)([.][^.]+|)$/;
+        if (exists $sub{$ext}) {
+            my @value = $sub{$ext}->($base, $ext);
+            return @value if @value;
+        }
+        next;
     }
-    closedir($fh) or die("Failed to close dir '$dir' after reading: $!\n");
-    return wantarray ? @file : $file[0];
-}
-
-sub read_file {
-    my ($file) = @_;
-    open(my $fh, "<", $file) or return ();
-    my @data = <$fh>;
-    chomp(@data);
-    close($fh) or die "Failed to close file '$file' after reading: $!\n";
-    return wantarray ? @data : $data[0];
-}
-
-sub delete_file {
-    my ($file) = @_;
-    unlink($file) or die "Failed to delete file '$file': $!\n";
-}
-
-sub rename_file {
-    my ($file, $dest_dir) = @_;
-    rename($file, $dest_dir)
-        or die "Failed to move '$file' to dir '$dest_dir': $!\n";
+    return ();
 }
 
 ################################################################################
+
+# Functions to send to first_matching_file(), each processes one file
+# extension. Return () to continue processing, return something (whatever) to
+# have this returned from first_matching_file().
+my %unlocked_todo_file = (
+    # Cleanup of orphaned .log files.
+    ".log" => sub {
+        my ($base, $ext) = @_;
+        if (not -e "$base.todo") {
+            unlink("$base.log") or die "Failed to delete file '$base.log': $!\n";
+            warn "Deleted orphaned log file: $base.log\n";
+        }
+        return ();
+    },
+    # Return filehandle + basename + filename of unlocked .todo file.
+    ".todo" => sub {
+        my ($base, $ext) = @_;
+        open(my $fh, "<", "$base.todo")  or die "Failed to open job file '$base.todo' for reading: $!";
+        flock($fh, LOCK_EX | LOCK_NB) or do {
+            warn "Ignoring running job: $base.todo\n";
+            return ();
+        };
+        return ($fh, $base, "$base$ext");
+    },
+);
+
 
 #
 # 1. An exclusive lock on 'batch.todo' file must exist throughout the
@@ -67,34 +62,21 @@ sub rename_file {
 #
 my $count = 0;
 my @ignore_file;
-while (defined(my $file = read_dir($dir, @ignore_file))) {
-
-    if (not $file =~ m#\.todo#) {              # for non-'.todo' files
-        if ($file =~ m#^ (.*) \.log $#x and not -e "$1.todo") {
-            warn "Deleting orphaned log file '$file'\n";
-            delete_file "$file";
-        }
-        push @ignore_file, $file;
-        next;
-    }
-
-    my ($todo_file, $done_file, $log_file) = do {
-        my ($base) = $file =~ m#^(.*)\.todo$#;
-        ("$dir/$base.todo", "$dir/$base.done", "$dir/$base.log");
-    };
-
-    open(my $todo, "<", $todo_file)
-        or die "Failed to open job file '$todo_file' for reading: $!";
-
-    flock($todo, LOCK_EX | LOCK_NB) or do {
-        warn "Job '$file' is in progress, won't touch\n";
-        push @ignore_file, $file;
-        next;
-    };
+while (my ($todo, $base, $file) =
+           first_matching_file($dir, %unlocked_todo_file)) {
+    my $todo_file = "$dir/$base.todo";
+    my $done_file = "$dir/$base.done";
+    my $log_file  = "$dir/$base.log";
 
     # Read previously processed ids from log (if any).
-    my %already_done = map { ($_ => 1) } read_file($log_file);
-    warn "Job '$file' is unfinished, resuming it\n" if %already_done;
+    my %already_done = map {
+        ($_ => 1);
+    } read_file($log_file, chomp => 1, err_mode => 'quiet');
+    if (%already_done) {
+        warn "Resuming unfinished job: $file\n";
+    } elsif ($! ne "No such file or directory") {
+        die "Failed to open file '$log_file' for reading: $!\n";
+    }
 
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
@@ -116,17 +98,16 @@ while (defined(my $file = read_dir($dir, @ignore_file))) {
         print $log "$id\n";
         $already_done{$id} = 1;
     }
-    print "    Done\n";
-    close($log) or die "Failed to close file '$log_file' after writing: $!\n";
-    rename_file($todo_file, $done_file);       # 1. mark job as done by rename
-    delete_file($log_file);                    # 2. delete progress log
-    close($todo)                               # 3. release lock last
-        or die "Failed to close file '$todo_file' after reading: $!\n";
+    close($log)                    or die "Failed to close file '$log_file' after writing: $!\n";
+    # Below order is super-important for atomicness!
+    # (Rename '.todo' -> '.done' first, then delete logfile, close '.todo' last.)
+    rename($todo_file, $done_file) or die "Failed to rename file '$todo_file' to '$done_file': $!\n";
+    unlink($log_file)              or die "Failed to delete file '$log_file': $!\n";
+    close($todo)                   or die "Failed to close file '$todo_file' after reading: $!\n";
 }
-if ($count == 0) {
-    print "No '.todo' files found to process\n";
-} else {
-    print "Processed $count '.todo' files\n";
-}
+
+print $count == 0
+    ? "No unstarted jobs found in '$dir'\n"
+    : "Processed $count jobs in '$dir'\n";
 
 #[eof]
