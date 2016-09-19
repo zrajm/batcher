@@ -10,24 +10,31 @@ my $dir = ".";
 
 ################################################################################
 
-# Process first matching file in specified dir. $subs is hashref with file
-# extensions as keys (eg '.log') and callback function as values. For each file
-# found with specified file extension, the callback is invoked (with filename
-# w/o extension as first arg, and file ext [including period] as second arg).
-# First callback that returns anything but empty list will cause
-# first_matching_file() to exit with whatever the callback returned.
-sub first_matching_file {
-    my ($dir, $subs) = @_;
-    opendir(my $dh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
-    while (defined(my $file = readdir($dh))) {
-        my ($base, $ext) = $file =~ /^(.*?)([.][^.]+|)$/;
-        if (exists $subs->{$ext}) {
-            my @value = $subs->{$ext}->($base, $ext);
-            return @value if @value;
+# batch({ EXT => FUNCTION[, ...] }, DIR);
+#
+# For each file in DIR, run FUNCTION for the file with the matching file EXT
+# (e.g. '.txt'). When FUNCTION return true, the batch job counter will be
+# incremented and DIR will be re-scanned and reprocessed from the beginning
+# (useful for parallel processing). To avoid processing the same batch file
+# repeatedly, either rename it (giving it a different file EXT) or maintain
+# your own list of already processed batch files.
+sub batch {
+    my ($subs, $dir) = @_;
+    my $ext_re = join("|", map { quotemeta($_) } keys %$subs);
+    my $count = 0;
+  JOB_FILE: {
+        opendir(my $dh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
+      LINE: while (defined(my $file = readdir($dh))) {
+            my ($base, $ext) = $file =~ /^(.*?)($ext_re)$/ or next LINE;
+            if (exists $subs->{$ext}) {
+                $subs->{$ext}($base, $ext) and do {
+                    $count += 1;
+                    redo JOB_FILE;
+                };
+            }
         }
-        next;
     }
-    return ();
+    return $count;
 }
 
 # Delete specified '.log' file unless it has a corresponding '.todo' file.
@@ -40,19 +47,7 @@ sub cleanup_indexing_logfile {
     return ();
 }
 
-# Return filehandle + basename + filename of unlocked .todo file.
-sub process_indexing_todofile {
-    my ($base, $ext) = @_;
-    open(my $fh, "<", "$base.todo") or die "Failed to open job file '$base.todo' for reading: $!";
-    flock($fh, LOCK_EX | LOCK_NB) or do {
-        warn "Ignoring running job: $base.todo\n";
-        return ();
-    };
-    return ($fh, $base, "$base$ext");
-}
-
-################################################################################
-
+# Return after having processed a file, false otherwise.
 #
 # Multiple Processes and Race Conditions
 # ======================================
@@ -64,13 +59,13 @@ sub process_indexing_todofile {
 #    done by renaming it 'batch.done'. This way, if the 'batch.todo' job ever
 #    crashes, it can always be resumed (since the logfile will always exist).
 #
-my $file_funcs = {
-    ".log"  => \&cleanup_indexing_logfile,
-    ".todo" => \&process_indexing_todofile,
-};
-my $count = 0;
-my @ignore_file;
-while (my ($todo, $base, $file) = first_matching_file($dir, $file_funcs)) {
+sub process_indexing_todofile {
+    my ($base, $ext) = @_;
+    open(my $todo, "<", "$base.todo") or die "Failed to open job file '$base.todo' for reading: $!";
+    flock($todo, LOCK_EX | LOCK_NB) or do {
+        warn "Ignoring running job: $base.todo\n";
+        return ();
+    };
     my $todo_file = "$dir/$base.todo";
     my $done_file = "$dir/$base.done";
     my $log_file  = "$dir/$base.log";
@@ -80,14 +75,13 @@ while (my ($todo, $base, $file) = first_matching_file($dir, $file_funcs)) {
         my @x = eval { read_file($log_file) };
         die "Failed to read file '$log_file': $!\n" if $@;
         map { chomp; ($_ => 1 ) } @x;
-    } : ()) and warn "Resuming unfinished job: $file\n";
+    } : ()) and warn "Resuming unfinished job: $todo_file\n";
 
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
     $log->autoflush();
 
-    print "PROCESSING: '$file'\n";
-    $count += 1;
+    print "PROCESSING: '$todo_file'\n";
     while (defined(my $id = <$todo>)) {
         chomp($id);
         if (exists $already_done{$id}) {
@@ -108,8 +102,17 @@ while (my ($todo, $base, $file) = first_matching_file($dir, $file_funcs)) {
     rename($todo_file, $done_file) or die "Failed to rename file '$todo_file' to '$done_file': $!\n";
     unlink($log_file)              or die "Failed to delete file '$log_file': $!\n";
     close($todo)                   or die "Failed to close file '$todo_file' after reading: $!\n";
+    return 1;
 }
 
+################################################################################
+
+my $file_funcs = {
+    ".log"  => \&cleanup_indexing_logfile,
+    ".todo" => \&process_indexing_todofile,
+};
+
+my $count = batch($file_funcs, $dir);
 print $count == 0
     ? "No unstarted jobs found in '$dir'\n"
     : "Processed $count jobs in '$dir'\n";
