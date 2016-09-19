@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use Fcntl qw(LOCK_EX LOCK_NB);
 use File::Slurp 'read_file';
+use IO::Handle;
 
 my $dir = ".";
 
@@ -52,9 +53,11 @@ my %unlocked_todo_file = (
 
 
 #
+# Multiple Processes and Race Conditions
+# ======================================
 # 1. An exclusive lock on 'batch.todo' file must exist throughout the
-#   'batch.log' file's existence. (We can then use the lock to determine if a
-#   job is currently in progress, without any race conditions.)
+#    'batch.log' file's existence. (We can then use the lock to determine if a
+#    job is currently in progress, without any race conditions.)
 #
 # 2. 'batch.log' must be deleted only after 'batch.todo' has been marked as
 #    done by renaming it 'batch.done'. This way, if the 'batch.todo' job ever
@@ -80,7 +83,7 @@ while (my ($todo, $base, $file) =
 
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
-    select((select($log), $| = 1)[0]);         # don't buffer log
+    $log->autoflush();
 
     print "PROCESSING: '$file'\n";
     $count += 1;
