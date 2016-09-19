@@ -3,14 +3,14 @@
 use strict;
 use warnings;
 use Fcntl qw(LOCK_EX LOCK_NB);
-use File::Slurp 'read_file';
+use File::Slurp qw(read_file read_dir);
 use IO::Handle;
 
-my $dir = ".";
+my $batch_dir = "x";
 
 ################################################################################
 
-# batch({ EXT => FUNCTION[, ...] }, DIR);
+# batch(DIR, { EXT => FUNCTION[, ...] });
 #
 # For each file in DIR, run FUNCTION for the file with the matching file EXT
 # (e.g. '.txt'). When FUNCTION return true, the batch job counter will be
@@ -19,17 +19,19 @@ my $dir = ".";
 # repeatedly, either rename it (giving it a different file EXT) or maintain
 # your own list of already processed batch files.
 sub batch {
-    my ($subs, $dir) = @_;
+    my ($dir, $subs) = @_;
     my $ext_re = join("|", map { quotemeta($_) } keys %$subs);
     my $count = 0;
-  BATCH_FILE: {
-        opendir(my $dh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
-      LINE: while (defined(my $file = readdir($dh))) {
-            my ($base, $ext) = $file =~ /^(.*?)($ext_re)$/ or next LINE;
+  READ_DIR: {
+        my @batch_file = map { "$dir/$_" } sort eval { read_dir($dir) };
+        die "Failed to read batch directory '$dir': $!\n" if $@;
+      FILE: foreach my $file (@batch_file) {
+            my ($base, $ext) = $file =~ /^(.*?)($ext_re)$/
+                or next FILE;
             if (exists $subs->{$ext}) {
                 $subs->{$ext}($base, $ext) and do {
                     $count += 1;
-                    redo BATCH_FILE;
+                    redo READ_DIR;
                 };
             }
         }
@@ -67,9 +69,9 @@ sub process_indexing_todofile {
         warn "Skipping currently running batch: $base.todo\n";
         return ();
     };
-    my $todo_file = "$dir/$base.todo";
-    my $done_file = "$dir/$base.done";
-    my $log_file  = "$dir/$base.log";
+    my $todo_file = "$base.todo";
+    my $done_file = "$base.done";
+    my $log_file  = "$base.log";
 
     # Read previously processed ids from log (if any).
     my %already_done = (-e $log_file ? do {
@@ -108,14 +110,12 @@ sub process_indexing_todofile {
 
 ################################################################################
 
-my $file_funcs = {
+my $count = batch($batch_dir, {
     ".log"  => \&cleanup_indexing_logfile,
     ".todo" => \&process_indexing_todofile,
-};
-
-my $count = batch($file_funcs, $dir);
+});
 print $count == 0
-    ? "No unstarted batches found in dir '$dir'\n"
-    : "Processed $count batches in dir '$dir'\n";
+    ? "No unstarted batches found in dir '$batch_dir'\n"
+    : "Processed $count batches in dir '$batch_dir'\n";
 
 #[eof]
