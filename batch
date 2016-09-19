@@ -76,15 +76,11 @@ while (my ($todo, $base, $file) = first_matching_file($dir, $file_funcs)) {
     my $log_file  = "$dir/$base.log";
 
     # Read previously processed ids from log (if any).
-    # FIXME: currently die()s on zero byte file :(
-    my %already_done = map {
-        ($_ => 1);
-    } read_file($log_file, chomp => 1, err_mode => 'quiet');
-    if (%already_done) {
-        warn "Resuming unfinished job: $file\n";
-    } elsif ($! ne "No such file or directory") {
-        die "Failed to open file '$log_file' for reading: $!\n";
-    }
+    my %already_done = (-e $log_file ? do {
+        my @x = eval { read_file($log_file) };
+        die "Failed to read file '$log_file': $!\n" if $@;
+        map { chomp; ($_ => 1 ) } @x;
+    } : ()) and warn "Resuming unfinished job: $file\n";
 
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
