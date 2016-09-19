@@ -22,14 +22,14 @@ sub batch {
     my ($subs, $dir) = @_;
     my $ext_re = join("|", map { quotemeta($_) } keys %$subs);
     my $count = 0;
-  JOB_FILE: {
+  BATCH_FILE: {
         opendir(my $dh, $dir) or die "Failed to open dir '$dir' for reading: $!\n";
       LINE: while (defined(my $file = readdir($dh))) {
             my ($base, $ext) = $file =~ /^(.*?)($ext_re)$/ or next LINE;
             if (exists $subs->{$ext}) {
                 $subs->{$ext}($base, $ext) and do {
                     $count += 1;
-                    redo JOB_FILE;
+                    redo BATCH_FILE;
                 };
             }
         }
@@ -47,13 +47,14 @@ sub cleanup_indexing_logfile {
     return ();
 }
 
-# Return after having processed a file, false otherwise.
+# Return true after having processed a file, false of no lock could be
+# established on that file.
 #
 # Multiple Processes and Race Conditions
 # ======================================
 # 1. An exclusive lock on 'batch.todo' file must exist throughout the
 #    'batch.log' file's existence. (We can then use the lock to determine if a
-#    job is currently in progress, without any race conditions.)
+#    batch job is currently in progress, without any race conditions.)
 #
 # 2. 'batch.log' must be deleted only after 'batch.todo' has been marked as
 #    done by renaming it 'batch.done'. This way, if the 'batch.todo' job ever
@@ -61,9 +62,9 @@ sub cleanup_indexing_logfile {
 #
 sub process_indexing_todofile {
     my ($base, $ext) = @_;
-    open(my $todo, "<", "$base.todo") or die "Failed to open job file '$base.todo' for reading: $!";
+    open(my $todo, "<", "$base.todo") or die "Failed to open batch file '$base.todo' for reading: $!";
     flock($todo, LOCK_EX | LOCK_NB) or do {
-        warn "Ignoring running job: $base.todo\n";
+        warn "Skipping currently running batch: $base.todo\n";
         return ();
     };
     my $todo_file = "$dir/$base.todo";
@@ -75,7 +76,7 @@ sub process_indexing_todofile {
         my @x = eval { read_file($log_file) };
         die "Failed to read file '$log_file': $!\n" if $@;
         map { chomp; ($_ => 1 ) } @x;
-    } : ()) and warn "Resuming unfinished job: $todo_file\n";
+    } : ()) and warn "Resuming unfinished batch: $todo_file\n";
 
     open(my $log, ">>", $log_file)
         or die "Failed to open file '$log_file' for appending: $!";
@@ -85,7 +86,7 @@ sub process_indexing_todofile {
     while (defined(my $id = <$todo>)) {
         chomp($id);
         if (exists $already_done{$id}) {
-            print "    '$id' -- done by previous job\n";
+            print "    '$id' -- already processed\n";
             next;
         }
         print "    '$id' -- processing\n";
@@ -114,7 +115,7 @@ my $file_funcs = {
 
 my $count = batch($file_funcs, $dir);
 print $count == 0
-    ? "No unstarted jobs found in '$dir'\n"
-    : "Processed $count jobs in '$dir'\n";
+    ? "No unstarted batches found in dir '$dir'\n"
+    : "Processed $count batches in dir '$dir'\n";
 
 #[eof]
