@@ -14,26 +14,18 @@ my $batch_dir = "x";
 #
 # For each file in DIR, run FUNCTION for the file with the matching file EXT
 # (e.g. '.txt'). When FUNCTION return true, the batch job counter will be
-# incremented and DIR will be re-scanned and reprocessed from the beginning
-# (useful for parallel processing). To avoid processing the same batch file
-# repeatedly, either rename it (giving it a different file EXT) or maintain
-# your own list of already processed batch files.
+# incremented. Return the number of times a callback have returned true.
 sub batch {
     my ($dir, $subs) = @_;
     my $ext_re = join("|", map { quotemeta($_) } keys %$subs);
     my $count = 0;
-  READ_DIR: {
-        my @batch_file = map { "$dir/$_" } sort eval { read_dir($dir) };
-        die "Failed to read batch directory '$dir': $!\n" if $@;
-      FILE: foreach my $file (@batch_file) {
-            my ($base, $ext) = $file =~ /^(.*?)($ext_re)$/
-                or next FILE;
-            if (exists $subs->{$ext}) {
-                $subs->{$ext}($base, $ext) and do {
-                    $count += 1;
-                    redo READ_DIR;
-                };
-            }
+    my @batch_file = map { "$dir/$_" } sort eval { read_dir($dir) };
+    die "Failed to read batch directory '$dir': $!\n" if $@;
+    foreach my $file (@batch_file) {
+        my ($base, $ext) = $file =~ /^(.*?)($ext_re)$/
+            or next;
+        if (ref($subs->{$ext} // "") eq "CODE") {
+            $subs->{$ext}($base, $ext) and $count += 1;
         }
     }
     return $count;
