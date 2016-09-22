@@ -31,12 +31,12 @@ sub batch {
     return $count;
 }
 
-# Delete specified '.log' file unless it has a corresponding '.todo' file.
-sub cleanup_indexing_logfile {
+# Delete specified '.tmp' file unless it has a corresponding '.todo' file.
+sub cleanup_indexing_tempfile {
     my ($base, $ext) = @_;
     if (not -e "$base.todo") {
-        unlink("$base.log") or die "Failed to delete file '$base.log': $!\n";
-        warn "Deleted orphaned log file: $base.log\n";
+        unlink("$base.tmp") or die "Failed to delete file '$base.tmp': $!\n";
+        warn "Deleted orphaned temp file: $base.tmp\n";
     }
     return ();
 }
@@ -47,37 +47,37 @@ sub cleanup_indexing_logfile {
 # Multiple Processes and Race Conditions
 # ======================================
 #
-# 1. Uses an exclusive lock on the batch log file to make sure that only one
-#    process work on the same batch. Also abort if the batch log file do not
+# 1. Uses an exclusive lock on the batch temp file to make sure that only one
+#    process work on the same batch. Also abort if the batch temp file do not
 #    still exists after getting the lock (some other process could possibly
 #    have sneaked in, just before we got the lock, and finished the job and
 #    removed the batch file). After we've gotten the lock, however, we know
 #    we're the only one working on this batch file, and we only need to check
-#    log file existence once.
+#    temp file existence once.
 #
-# 2. 'batch.log' must be deleted only after 'batch.todo' has been marked as
-#    done by renaming it 'batch.done'. This way, if the 'batch.log' job ever
-#    crashes, it can always be resumed (since the log file will always exist).
+# 2. 'batch.tmp' must be deleted only after 'batch.todo' has been marked as
+#    done by renaming it 'batch.done'. This way, if the 'batch.tmp' job ever
+#    crashes, it can always be resumed (since the temp file will always exist).
 #
 sub process_indexing_todofile {
     my ($base, $ext) = @_;
     my $todo_file = "$base.todo";
     my $done_file = "$base.done";
-    my $log_file  = "$base.log";
+    my $temp_file = "$base.tmp";
 
-    # Open and lock log file, and make sure that it's still there afterwards.
+    # Open and lock temp file, and make sure that it's still there afterwards.
     # (This should guarantee that we're alone in working on this batch, and
     # that no other process managed to complete it just before got the lock.)
-    open(my $log, "+>>", $log_file)
-        or die "Failed to open temp file '$log_file' for reading/writing: $!";
-    flock($log, LOCK_EX | LOCK_NB) or do {
+    open(my $temp, "+>>", $temp_file)
+        or die "Failed to open temp file '$temp_file' for reading/writing: $!";
+    flock($temp, LOCK_EX | LOCK_NB) or do {
         if ($! eq "Resource temporarily unavailable") {
             warn "Skipping currently running batch: $todo_file\n";
             return ();
         }
-        die "Failed to lock temp file '$log_file': $!\n";
+        die "Failed to lock temp file '$temp_file': $!\n";
     };
-    if (not -e $log_file) {
+    if (not -e $temp_file) {
         warn "Skipping already finished batch: $todo_file\n";
         return ();
     }
@@ -90,13 +90,13 @@ sub process_indexing_todofile {
         die "Failed to open batch file '$todo_file' for reading: $!";
     };
 
-    # Read previously processed ids from log (if any).
-    seek($log, 0, 0);
+    # Read previously processed ids from temp (if any).
+    seek($temp, 0, 0);
     my %already_done = do {
-        chomp(my @already_done = <$log>);
+        chomp(my @already_done = <$temp>);
         map { ($_ => 1 ) } @already_done;
     } and warn "Resuming unfinished batch: $todo_file\n";
-    $log->autoflush();
+    $temp->autoflush();
 
     print "PROCESSING: '$todo_file'\n";
     while (defined(my $id = <$todo>)) {
@@ -110,20 +110,20 @@ sub process_indexing_todofile {
         # index id   OR die "Failed to index!!"
         sleep 1;
 
-        print $log "$id\n";
+        print $temp "$id\n";
         $already_done{$id} = 1;
     }
     rename($todo_file, $done_file) or die "Failed to rename file '$todo_file' to '$done_file': $!\n";
     close($todo)                   or die "Failed to close file '$todo_file' after reading: $!\n";
-    unlink($log_file)              or die "Failed to delete file '$log_file': $!\n";
-    close($log)                    or die "Failed to close file '$log_file' after writing: $!\n";
+    unlink($temp_file)             or die "Failed to delete file '$temp_file': $!\n";
+    close($temp)                   or die "Failed to close file '$temp_file' after writing: $!\n";
     return 1;
 }
 
 ################################################################################
 
 my $count = batch($batch_dir, {
-    ".log"  => \&cleanup_indexing_logfile,
+    ".tmp"  => \&cleanup_indexing_tempfile,
     ".todo" => \&process_indexing_todofile,
 });
 print $count == 0
