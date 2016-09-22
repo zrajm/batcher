@@ -3,8 +3,8 @@
 use strict;
 use warnings;
 use Fcntl qw(LOCK_EX LOCK_NB);
-use File::Slurp qw(read_file read_dir);
-use IO::Handle;
+use File::Slurp qw(read_dir);
+use IO::Handle; # autoflush
 
 my $batch_dir = "x";
 
@@ -46,34 +46,56 @@ sub cleanup_indexing_logfile {
 #
 # Multiple Processes and Race Conditions
 # ======================================
-# 1. An exclusive lock on 'batch.todo' file must exist throughout the
-#    'batch.log' file's existence. (We can then use the lock to determine if a
-#    batch job is currently in progress, without any race conditions.)
+#
+# 1. Uses an exclusive lock on the batch log file to make sure that only one
+#    process work on the same batch. Also abort if the batch log file do not
+#    still exists after getting the lock (some other process could possibly
+#    have sneaked in, just before we got the lock, and finished the job and
+#    removed the batch file). After we've gotten the lock, however, we know
+#    we're the only one working on this batch file, and we only need to check
+#    log file existence once.
 #
 # 2. 'batch.log' must be deleted only after 'batch.todo' has been marked as
-#    done by renaming it 'batch.done'. This way, if the 'batch.todo' job ever
-#    crashes, it can always be resumed (since the logfile will always exist).
+#    done by renaming it 'batch.done'. This way, if the 'batch.log' job ever
+#    crashes, it can always be resumed (since the log file will always exist).
 #
 sub process_indexing_todofile {
     my ($base, $ext) = @_;
-    open(my $todo, "<", "$base.todo") or die "Failed to open batch file '$base.todo' for reading: $!";
-    flock($todo, LOCK_EX | LOCK_NB) or do {
-        warn "Skipping currently running batch: $base.todo\n";
-        return ();
-    };
     my $todo_file = "$base.todo";
     my $done_file = "$base.done";
     my $log_file  = "$base.log";
 
-    # Read previously processed ids from log (if any).
-    my %already_done = (-e $log_file ? do {
-        my @x = eval { read_file($log_file) };
-        die "Failed to read file '$log_file': $!\n" if $@;
-        map { chomp; ($_ => 1 ) } @x;
-    } : ()) and warn "Resuming unfinished batch: $todo_file\n";
+    # Open and lock log file, and make sure that it's still there afterwards.
+    # (This should guarantee that we're alone in working on this batch, and
+    # that no other process managed to complete it just before got the lock.)
+    open(my $log, "+>>", $log_file)
+        or die "Failed to open temp file '$log_file' for reading/writing: $!";
+    flock($log, LOCK_EX | LOCK_NB) or do {
+        if ($! eq "Resource temporarily unavailable") {
+            warn "Skipping currently running batch: $todo_file\n";
+            return ();
+        }
+        die "Failed to lock temp file '$log_file': $!\n";
+    };
+    if (not -e $log_file) {
+        warn "Skipping already finished batch: $todo_file\n";
+        return ();
+    }
 
-    open(my $log, ">>", $log_file)
-        or die "Failed to open file '$log_file' for appending: $!";
+    open(my $todo, "<", "$todo_file") or do {
+        if ($! eq "No such file or directory") {
+            warn "Skipping already finished batch: $todo_file\n";
+            return ();
+        }
+        die "Failed to open batch file '$todo_file' for reading: $!";
+    };
+
+    # Read previously processed ids from log (if any).
+    seek($log, 0, 0);
+    my %already_done = do {
+        chomp(my @already_done = <$log>);
+        map { ($_ => 1 ) } @already_done;
+    } and warn "Resuming unfinished batch: $todo_file\n";
     $log->autoflush();
 
     print "PROCESSING: '$todo_file'\n";
@@ -91,12 +113,10 @@ sub process_indexing_todofile {
         print $log "$id\n";
         $already_done{$id} = 1;
     }
-    close($log)                    or die "Failed to close file '$log_file' after writing: $!\n";
-    # Below order is super-important for atomicness!
-    # (Rename '.todo' -> '.done' first, then delete logfile, close '.todo' last.)
     rename($todo_file, $done_file) or die "Failed to rename file '$todo_file' to '$done_file': $!\n";
-    unlink($log_file)              or die "Failed to delete file '$log_file': $!\n";
     close($todo)                   or die "Failed to close file '$todo_file' after reading: $!\n";
+    unlink($log_file)              or die "Failed to delete file '$log_file': $!\n";
+    close($log)                    or die "Failed to close file '$log_file' after writing: $!\n";
     return 1;
 }
 
